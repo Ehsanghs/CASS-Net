@@ -21,3 +21,10 @@ CASS-Net/
 ├── train.py               # Training Script
 ├── requirements.txt       # Dependencies
 └── README.md              # Documentation
+
+🚀 Getting Started
+1. Prerequisites
+Install the required packages:
+code
+Bash
+pip install -r requirements.txt
