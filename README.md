@@ -1,4 +1,5 @@
 # CASS-Net
+CASS-Net: A Lightweight, Context-Aware Dual-Attention Architecture for Real-Time Stroke Lesion Segmentation
 ## 🏗 Model Architecture
 
 CASS-Net is designed for the performance-efficiency trade-off required in emergency settings:
@@ -21,10 +22,3 @@ CASS-Net/
 ├── train.py               # Training Script
 ├── requirements.txt       # Dependencies
 └── README.md              # Documentation
-
-🚀 Getting Started
-1. Prerequisites
-Install the required packages:
-code
-Bash
-pip install -r requirements.txt
