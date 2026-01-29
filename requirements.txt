@@ -1,0 +1,7 @@
+torch>=2.0.0
+timm
+albumentations
+pydicom
+opencv-python-headless
+medpy
+tqdm
