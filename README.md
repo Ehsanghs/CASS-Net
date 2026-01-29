@@ -12,11 +12,11 @@ CASS-Net is designed for the performance-efficiency trade-off required in emerge
 
 CASS-Net/
 ├── models/
-│   ├── cass_net.py        # Main Model Architecture
-│   └── layers.py          # Custom Blocks (SE, AG, DSConv)
+│   ├── cass_net.py
+│   ├── layers.py
+│   └── __init__.py
 ├── utils/
-│   ├── dataset.py         # 2.5D Data Loader & Windowing
-│   └── losses.py          # Composite Loss (Focal Tversky + Dice)
-├── train.py               # Training Script
-├── requirements.txt       # Dependencies
-└── README.md              # Documentation
+│   ├── dataset.py
+│   └── losses.py
+├── train.py
+└── requirements.txt
