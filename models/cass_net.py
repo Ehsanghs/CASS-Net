@@ -10,7 +10,6 @@ class CASSNet(nn.Module):
         self.num_input_channels = num_input_channels
         
         # Encoder: EfficientNet-Lite0
-        # Creating model with timm
         self.backbone = timm.create_model(
             backbone_name,
             pretrained=True,
@@ -19,15 +18,11 @@ class CASSNet(nn.Module):
             out_indices=(1, 2, 3, 4)
         )
         
-        # Hardcoded channels for EfficientNet-Lite0 to avoid runtime dummy input checks
         # Features at indices 1, 2, 3, 4
-        self.skip_channels = [24, 40, 112] # e1, e2, e3
-        self.deepest_channels = 320        # e4
+        self.skip_channels = [24, 40, 112] 
+        self.deepest_channels = 320        
         
-        # Decoder Channels
-        C_decode = [112, 40, 24, 16] # Adjusted to match logical progression or paper spec
-        # Note: Your original code used [80, 40, 24, 16] but mapped from 320. 
-        # Let's stick to your original code's logic for consistency with your results.
+        # Decoder configuration used for the experiments reported in the manuscript
         C_decode = [80, 40, 24, 16]
 
         # --- Decoder Blocks ---
@@ -82,15 +77,13 @@ class CASSNet(nn.Module):
         
         # Encoder
         feats = self.backbone(x)
-        # feats[0] is usually stem/stride2, we use [1,2,3,4] based on indices
-        skips = feats[:-1]     # [stride4, stride8, stride16] -> [24, 40, 112]
-        center_deepest = feats[-1] # stride32 -> 320
+        skips = feats[:-1]     
+        center_deepest = feats[-1] 
 
         # Decoder 1
         d1_up = self.dec1_up(center_deepest)
         d1 = self.dec1_post_up_conv(d1_up)
         s2 = skips[2] 
-        # Safe interpolation if sizes slightly mismatch due to odd input dims
         if s2.shape[2:] != d1.shape[2:]:
             s2 = F.interpolate(s2, size=d1.shape[2:], mode='bilinear', align_corners=False)
         s2_att = self.dec1_ag(d1, s2)
@@ -126,7 +119,6 @@ class CASSNet(nn.Module):
         out_small = self.final_conv(d4_out)
         out = self.final_upsample(out_small)
         
-        # Ensure exact output match
         if out.shape[2:] != input_size:
             out = F.interpolate(out, size=input_size, mode='bilinear', align_corners=False)
 
