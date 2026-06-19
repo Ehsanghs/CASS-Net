@@ -1,97 +1,133 @@
+import os
+import glob
+import numpy as np
+import pydicom
+import cv2
 import torch
 from torch.utils.data import Dataset
-import numpy as np
-import cv2
-import pydicom
-from pathlib import Path
-import re
 
 class AISDataset(Dataset):
-    def __init__(self, data_dir, patient_ids, transform=None, 
-                 global_hu_clip=(-100, 300), 
-                 windows=[(40, 80), (80, 200)]):
+    def __init__(self, data_dir, patient_ids, transform=None):
         """
-        data_dir: Path to root dataset folder
-        patient_ids: List of patient IDs to include
+        Args:
+            data_dir (str): Root directory of the dataset.
+            patient_ids (list): List of patient IDs to include in this split.
+            transform (albumentations.Compose): Transformations for data augmentation/preprocessing.
         """
-        self.data_dir = Path(data_dir)
-        self.images_dir = self.data_dir / "images"
-        self.masks_dir = self.data_dir / "masks"
+        self.data_dir = data_dir
         self.patient_ids = patient_ids
         self.transform = transform
         
-        self.hu_min, self.hu_max = global_hu_clip
-        self.windows = windows # [(center, width), ...]
+        # Hyperparameters according to the manuscript (Algorithm 1)
+        self.hu_clip_range = (-100, 300)
         self.hu_divisor = 100.0
+        self.stroke_window = (40, 80)  # (Center, Width)
+        self.brain_window = (80, 200)  # (Center, Width)
         
         self.samples = self._prepare_samples()
-        print(f"Dataset initialized with {len(self.samples)} samples from {len(patient_ids)} patients.")
-
+        
     def _prepare_samples(self):
+        """
+        Organizes all slices per patient sequentially to allow 2.5D construction.
+        Handles adjacent slice replication at volume boundaries.
+        """
         samples = []
         for pid in self.patient_ids:
-            # Logic to pair slices with neighbors (Same logic as provided code)
-            # Simplified here for brevity, assumes folder structure: /images/{pid}/CT/*.dcm
-            # ... (Insert your data parsing logic here from the original script)
-            pass 
+            # Expected structure: data_dir/images/pid/ and data_dir/masks/pid/
+            patient_img_dir = os.path.join(self.data_dir, 'images', str(pid))
+            patient_mask_dir = os.path.join(self.data_dir, 'masks', str(pid))
+            
+            if not os.path.exists(patient_img_dir):
+                continue
+                
+            # Retrieve and sort DICOM files (assuming sequential naming or instance numbers)
+            dcm_files = sorted(glob.glob(os.path.join(patient_img_dir, '*.dcm')))
+            num_slices = len(dcm_files)
+            
+            for i in range(num_slices):
+                # Replicate target slice at boundaries if adjacent slices are unavailable
+                prev_idx = max(0, i - 1)
+                next_idx = min(num_slices - 1, i + 1)
+                
+                base_name = os.path.splitext(os.path.basename(dcm_files[i]))[0]
+                mask_path = os.path.join(patient_mask_dir, f"{base_name}.png") 
+                
+                samples.append({
+                    'center_path': dcm_files[i],
+                    'prev_path': dcm_files[prev_idx],
+                    'next_path': dcm_files[next_idx],
+                    'mask_path': mask_path
+                })
         return samples
 
-    def load_dicom_and_process(self, path):
-        try:
-            dcm = pydicom.dcmread(str(path))
-            image = dcm.pixel_array.astype(np.float32)
-            slope = getattr(dcm, 'RescaleSlope', 1.0)
-            intercept = getattr(dcm, 'RescaleIntercept', 0.0)
-            image = image * slope + intercept
-            
-            # Clipping and Normalization (Sec 3.2)
-            image = np.clip(image, self.hu_min, self.hu_max)
-            image = image / self.hu_divisor
-            return image
-        except:
-            return None
-
-    def apply_window(self, norm_img, center_raw, width_raw):
-        # Convert raw center/width to normalized scale
-        c = center_raw / self.hu_divisor
-        w = width_raw / self.hu_divisor
+    def _read_and_normalize_dicom(self, path):
+        """Reads a DICOM file, applies RescaleSlope/Intercept, clips, and normalizes."""
+        dcm = pydicom.dcmread(path)
+        image = dcm.pixel_array.astype(np.float32)
         
-        img_min = c - w / 2
-        img_max = c + w / 2
+        slope = getattr(dcm, 'RescaleSlope', 1.0)
+        intercept = getattr(dcm, 'RescaleIntercept', 0.0)
+        image = image * slope + intercept
+        
+        # Step 1: Clip intensities to -100 to 300 HU and normalize by 100
+        image = np.clip(image, self.hu_clip_range[0], self.hu_clip_range[1])
+        image = image / self.hu_divisor
+        
+        return image
+
+    def _apply_window(self, norm_img, window):
+        """Applies a specific window (center, width) to the normalized image."""
+        center, width = window
+        # Convert window settings to the normalized scale
+        c_norm = center / self.hu_divisor
+        w_norm = width / self.hu_divisor
+        
+        img_min = c_norm - (w_norm / 2.0)
+        img_max = c_norm + (w_norm / 2.0)
+        
         windowed = np.clip(norm_img, img_min, img_max)
-        # Normalize to 0-1 range
-        return (windowed - img_min) / (img_max - img_min + 1e-6)
+        # Scale to [0, 1]
+        windowed = (windowed - img_min) / (img_max - img_min + 1e-6)
+        return windowed
+
+    def __len__(self):
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        # ... (Implementation of loading center + neighbors) ...
-        # Based on your script, you load center, prev, next.
+        sample = self.samples[idx]
         
-        # Example channel construction:
-        # ch1: Prev Slice (Stroke Window)
-        # ch2: Curr Slice (Stroke Window)
-        # ch3: Curr Slice (Brain Window)
-        # ch4: Next Slice (Stroke Window)
+        # 1. Load normalized HU images
+        center_img = self._read_and_normalize_dicom(sample['center_path'])
+        prev_img = self._read_and_normalize_dicom(sample['prev_path'])
+        next_img = self._read_and_normalize_dicom(sample['next_path'])
         
-        # Assuming we have loaded `img_prev`, `img_curr`, `img_next` (normalized)
+        # 2. Apply windows according to manuscript
+        ch1 = self._apply_window(prev_img, self.stroke_window)     # Si-1 SW
+        ch2 = self._apply_window(center_img, self.stroke_window)   # Si SW
+        ch3 = self._apply_window(center_img, self.brain_window)    # Si BW
+        ch4 = self._apply_window(next_img, self.stroke_window)     # Si+1 SW
         
-        # Stroke Window (40, 80) -> Index 0 in self.windows
-        sw_c, sw_w = self.windows[0]
-        # Brain Window (80, 200) -> Index 1 in self.windows
-        bw_c, bw_w = self.windows[1]
+        # 3. Construct the 4-channel 2.5D input tensor (H, W, 4)
+        image = np.stack([ch1, ch2, ch3, ch4], axis=-1).astype(np.float32)
         
-        c1 = self.apply_window(img_prev, sw_c, sw_w)
-        c2 = self.apply_window(img_curr, sw_c, sw_w)
-        c3 = self.apply_window(img_curr, bw_c, bw_w)
-        c4 = self.apply_window(img_next, sw_c, sw_w)
-        
-        image = np.stack([c1, c2, c3, c4], axis=-1)
-        
+        # 4. Load ground truth mask (or generate zero mask for lesion-negative slices)
+        if os.path.exists(sample['mask_path']):
+            mask = cv2.imread(sample['mask_path'], cv2.IMREAD_GRAYSCALE)
+            mask = (mask > 0).astype(np.float32) # Binarize
+        else:
+            mask = np.zeros(center_img.shape, dtype=np.float32)
+            
+        # 5. Apply online augmentations
         if self.transform:
             augmented = self.transform(image=image, mask=mask)
             image = augmented['image']
             mask = augmented['mask']
             
+        # Ensure mask has channel dimension (1, H, W) for loss calculation
+        if isinstance(mask, np.ndarray):
+            mask = np.expand_dims(mask, axis=0)
+            mask = torch.from_numpy(mask)
+        elif isinstance(mask, torch.Tensor) and mask.ndim == 2:
+            mask = mask.unsqueeze(0)
+            
         return {'image': image, 'mask': mask}
-
-    def __len__(self):
-        return len(self.samples)
