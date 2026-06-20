@@ -1,133 +1,297 @@
-import os
-import glob
+import re
+from pathlib import Path
+
+import cv2
 import numpy as np
 import pydicom
-import cv2
 import torch
 from torch.utils.data import Dataset
 
+
 class AISDataset(Dataset):
-    def __init__(self, data_dir, patient_ids, transform=None):
-        """
-        Args:
-            data_dir (str): Root directory of the dataset.
-            patient_ids (list): List of patient IDs to include in this split.
-            transform (albumentations.Compose): Transformations for data augmentation/preprocessing.
-        """
-        self.data_dir = data_dir
-        self.patient_ids = patient_ids
+    """Load AISD slices and construct four-channel 2.5D inputs."""
+
+    def __init__(
+        self,
+        data_dir,
+        patient_ids,
+        transform=None,
+        hu_clip=(-100.0, 300.0),
+        hu_divisor=100.0,
+        stroke_window=(40.0, 80.0),
+        brain_window=(80.0, 200.0),
+        lesion_labels=(1, 2, 3, 5),
+        return_metadata=False,
+        mode="dataset",
+    ):
+        self.data_dir = Path(data_dir)
+        self.images_dir = self.data_dir / "images"
+        self.masks_dir = self.data_dir / "masks"
+        self.patient_ids = [str(patient_id).strip() for patient_id in patient_ids]
         self.transform = transform
-        
-        # Hyperparameters according to the manuscript (Algorithm 1)
-        self.hu_clip_range = (-100, 300)
-        self.hu_divisor = 100.0
-        self.stroke_window = (40, 80)  # (Center, Width)
-        self.brain_window = (80, 200)  # (Center, Width)
-        
+        self.hu_min, self.hu_max = map(float, hu_clip)
+        self.hu_divisor = float(hu_divisor)
+        self.stroke_window = tuple(map(float, stroke_window))
+        self.brain_window = tuple(map(float, brain_window))
+        self.lesion_labels = tuple(int(label) for label in lesion_labels)
+        self.return_metadata = return_metadata
+        self.mode = mode
+
+        if not self.images_dir.is_dir():
+            raise FileNotFoundError(f"Images directory not found: {self.images_dir}")
+
+        if not self.masks_dir.is_dir():
+            raise FileNotFoundError(f"Masks directory not found: {self.masks_dir}")
+
+        if not self.patient_ids:
+            raise ValueError("patient_ids is empty.")
+
+        if len(self.patient_ids) != len(set(self.patient_ids)):
+            raise ValueError("patient_ids contains duplicate values.")
+
         self.samples = self._prepare_samples()
-        
+
+    @staticmethod
+    def _mask_instance(mask_path):
+        match = re.fullmatch(r"(\d+)\.png", mask_path.name, flags=re.IGNORECASE)
+        return int(match.group(1)) if match else None
+
+    @staticmethod
+    def _dicom_header(dicom_path):
+        try:
+            dcm = pydicom.dcmread(
+                str(dicom_path),
+                specific_tags=["InstanceNumber", "SliceLocation"],
+                stop_before_pixels=True,
+            )
+        except Exception:
+            return None
+
+        if "InstanceNumber" not in dcm or "SliceLocation" not in dcm:
+            return None
+
+        return {
+            "path": dicom_path,
+            "instance": int(dcm.InstanceNumber),
+            "slice_location": float(dcm.SliceLocation),
+        }
+
     def _prepare_samples(self):
-        """
-        Organizes all slices per patient sequentially to allow 2.5D construction.
-        Handles adjacent slice replication at volume boundaries.
-        """
         samples = []
-        for pid in self.patient_ids:
-            # Expected structure: data_dir/images/pid/ and data_dir/masks/pid/
-            patient_img_dir = os.path.join(self.data_dir, 'images', str(pid))
-            patient_mask_dir = os.path.join(self.data_dir, 'masks', str(pid))
-            
-            if not os.path.exists(patient_img_dir):
-                continue
-                
-            # Retrieve and sort DICOM files (assuming sequential naming or instance numbers)
-            dcm_files = sorted(glob.glob(os.path.join(patient_img_dir, '*.dcm')))
-            num_slices = len(dcm_files)
-            
-            for i in range(num_slices):
-                # Replicate target slice at boundaries if adjacent slices are unavailable
-                prev_idx = max(0, i - 1)
-                next_idx = min(num_slices - 1, i + 1)
-                
-                base_name = os.path.splitext(os.path.basename(dcm_files[i]))[0]
-                mask_path = os.path.join(patient_mask_dir, f"{base_name}.png") 
-                
-                samples.append({
-                    'center_path': dcm_files[i],
-                    'prev_path': dcm_files[prev_idx],
-                    'next_path': dcm_files[next_idx],
-                    'mask_path': mask_path
-                })
+        skipped = 0
+        represented_patients = 0
+
+        for patient_id in self.patient_ids:
+            dicom_dir = self.images_dir / patient_id / "CT"
+            mask_dir = self.masks_dir / patient_id
+
+            if not dicom_dir.is_dir() or not mask_dir.is_dir():
+                raise FileNotFoundError(
+                    f"Missing image or mask directory for patient {patient_id}."
+                )
+
+            masks = {}
+            for mask_path in mask_dir.glob("*.png"):
+                instance = self._mask_instance(mask_path)
+                if instance is not None:
+                    masks[instance] = mask_path
+
+            dicom_records = []
+            for dicom_path in dicom_dir.glob("*.dcm"):
+                record = self._dicom_header(dicom_path)
+                if record is None:
+                    skipped += 1
+                    continue
+                dicom_records.append(record)
+
+            dicom_records.sort(key=lambda item: item["slice_location"])
+
+            paired_records = []
+            for record in dicom_records:
+                mask_path = masks.get(record["instance"])
+                if mask_path is None:
+                    skipped += 1
+                    continue
+
+                paired_records.append(
+                    {
+                        "patient_id": patient_id,
+                        "instance": record["instance"],
+                        "dicom_path": record["path"],
+                        "mask_path": mask_path,
+                    }
+                )
+
+            if not paired_records:
+                raise RuntimeError(
+                    f"No valid DICOM-mask pairs found for patient {patient_id}."
+                )
+
+            records_by_instance = {
+                record["instance"]: record for record in paired_records
+            }
+
+            for record in paired_records:
+                instance = record["instance"]
+                previous_record = records_by_instance.get(instance - 1, record)
+                next_record = records_by_instance.get(instance + 1, record)
+
+                samples.append(
+                    {
+                        "patient_id": patient_id,
+                        "instance": instance,
+                        "center_path": record["dicom_path"],
+                        "previous_path": previous_record["dicom_path"],
+                        "next_path": next_record["dicom_path"],
+                        "mask_path": record["mask_path"],
+                    }
+                )
+
+            represented_patients += 1
+
+        if not samples:
+            raise RuntimeError(f"No valid samples found for {self.mode}.")
+
+        print(
+            f"Found {len(samples)} verified pairs for {self.mode} "
+            f"from {represented_patients} patients."
+        )
+
+        if skipped:
+            print(f"Skipped {skipped} unpaired or incomplete DICOM records.")
+
         return samples
 
-    def _read_and_normalize_dicom(self, path):
-        """Reads a DICOM file, applies RescaleSlope/Intercept, clips, and normalizes."""
-        dcm = pydicom.dcmread(path)
-        image = dcm.pixel_array.astype(np.float32)
-        
-        slope = getattr(dcm, 'RescaleSlope', 1.0)
-        intercept = getattr(dcm, 'RescaleIntercept', 0.0)
-        image = image * slope + intercept
-        
-        # Step 1: Clip intensities to -100 to 300 HU and normalize by 100
-        image = np.clip(image, self.hu_clip_range[0], self.hu_clip_range[1])
-        image = image / self.hu_divisor
-        
-        return image
+    def _load_dicom(self, dicom_path):
+        try:
+            dcm = pydicom.dcmread(str(dicom_path))
+            image = dcm.pixel_array.astype(np.float32)
+        except Exception as exc:
+            raise RuntimeError(f"Could not read DICOM file: {dicom_path}") from exc
 
-    def _apply_window(self, norm_img, window):
-        """Applies a specific window (center, width) to the normalized image."""
+        slope = float(getattr(dcm, "RescaleSlope", 1.0))
+        intercept = float(getattr(dcm, "RescaleIntercept", 0.0))
+
+        image = image * slope + intercept
+        image = np.clip(image, self.hu_min, self.hu_max)
+        image = image / self.hu_divisor
+
+        return image, dcm
+
+    def _apply_window(self, image, window):
         center, width = window
-        # Convert window settings to the normalized scale
-        c_norm = center / self.hu_divisor
-        w_norm = width / self.hu_divisor
-        
-        img_min = c_norm - (w_norm / 2.0)
-        img_max = c_norm + (w_norm / 2.0)
-        
-        windowed = np.clip(norm_img, img_min, img_max)
-        # Scale to [0, 1]
-        windowed = (windowed - img_min) / (img_max - img_min + 1e-6)
-        return windowed
+        center /= self.hu_divisor
+        width /= self.hu_divisor
+
+        lower = center - width / 2.0
+        upper = center + width / 2.0
+
+        image = np.clip(image, lower, upper)
+        return ((image - lower) / (upper - lower + 1e-6)).astype(np.float32)
+
+    def _load_mask(self, mask_path, expected_shape):
+        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+
+        if mask is None:
+            raise RuntimeError(f"Could not read mask file: {mask_path}")
+
+        if mask.shape != expected_shape:
+            raise ValueError(
+                f"Mask shape {mask.shape} does not match image shape "
+                f"{expected_shape} for {mask_path}."
+            )
+
+        return np.isin(mask, self.lesion_labels).astype(np.float32)
+
+    @staticmethod
+    def _image_tensor(image):
+        if isinstance(image, torch.Tensor):
+            return image.float()
+
+        image = np.ascontiguousarray(image.transpose(2, 0, 1))
+        return torch.from_numpy(image).float()
+
+    @staticmethod
+    def _mask_tensor(mask):
+        if isinstance(mask, torch.Tensor):
+            tensor = mask.float()
+        else:
+            tensor = torch.from_numpy(np.ascontiguousarray(mask)).float()
+
+        if tensor.ndim == 2:
+            tensor = tensor.unsqueeze(0)
+
+        return tensor
+
+    def __getitem__(self, index):
+        sample = self.samples[index]
+
+        center, center_dicom = self._load_dicom(sample["center_path"])
+        previous, _ = self._load_dicom(sample["previous_path"])
+        next_image, _ = self._load_dicom(sample["next_path"])
+
+        if previous.shape != center.shape or next_image.shape != center.shape:
+            raise ValueError(
+                f"Adjacent slices have inconsistent shapes for patient "
+                f"{sample['patient_id']}, instance {sample['instance']}."
+            )
+
+        image = np.stack(
+            [
+                self._apply_window(previous, self.stroke_window),
+                self._apply_window(center, self.stroke_window),
+                self._apply_window(center, self.brain_window),
+                self._apply_window(next_image, self.stroke_window),
+            ],
+            axis=-1,
+        )
+
+        mask = self._load_mask(sample["mask_path"], center.shape)
+
+        if self.transform is not None:
+            transformed = self.transform(image=image, mask=mask)
+            image = transformed["image"]
+            mask = transformed["mask"]
+
+        image = self._image_tensor(image)
+        mask = self._mask_tensor(mask)
+
+        if image.shape[0] != 4:
+            raise ValueError(f"Expected 4 input channels, received {image.shape[0]}.")
+
+        if image.shape[1:] != mask.shape[1:]:
+            raise ValueError(
+                f"Image and mask shapes differ after transformation: "
+                f"{tuple(image.shape)} and {tuple(mask.shape)}."
+            )
+
+        result = {
+            "image": image,
+            "mask": mask,
+        }
+
+        if self.return_metadata:
+            pixel_spacing = getattr(center_dicom, "PixelSpacing", [float("nan")] * 2)
+            slice_thickness = float(
+                getattr(center_dicom, "SliceThickness", float("nan"))
+            )
+
+            result.update(
+                {
+                    "patient_id": sample["patient_id"],
+                    "instance_number": sample["instance"],
+                    "pixel_spacing": torch.tensor(
+                        [float(pixel_spacing[0]), float(pixel_spacing[1])],
+                        dtype=torch.float32,
+                    ),
+                    "slice_thickness": torch.tensor(
+                        slice_thickness,
+                        dtype=torch.float32,
+                    ),
+                }
+            )
+
+        return result
 
     def __len__(self):
         return len(self.samples)
-
-    def __getitem__(self, idx):
-        sample = self.samples[idx]
-        
-        # 1. Load normalized HU images
-        center_img = self._read_and_normalize_dicom(sample['center_path'])
-        prev_img = self._read_and_normalize_dicom(sample['prev_path'])
-        next_img = self._read_and_normalize_dicom(sample['next_path'])
-        
-        # 2. Apply windows according to manuscript
-        ch1 = self._apply_window(prev_img, self.stroke_window)     # Si-1 SW
-        ch2 = self._apply_window(center_img, self.stroke_window)   # Si SW
-        ch3 = self._apply_window(center_img, self.brain_window)    # Si BW
-        ch4 = self._apply_window(next_img, self.stroke_window)     # Si+1 SW
-        
-        # 3. Construct the 4-channel 2.5D input tensor (H, W, 4)
-        image = np.stack([ch1, ch2, ch3, ch4], axis=-1).astype(np.float32)
-        
-        # 4. Load ground truth mask (or generate zero mask for lesion-negative slices)
-        if os.path.exists(sample['mask_path']):
-            mask = cv2.imread(sample['mask_path'], cv2.IMREAD_GRAYSCALE)
-            mask = (mask > 0).astype(np.float32) # Binarize
-        else:
-            mask = np.zeros(center_img.shape, dtype=np.float32)
-            
-        # 5. Apply online augmentations
-        if self.transform:
-            augmented = self.transform(image=image, mask=mask)
-            image = augmented['image']
-            mask = augmented['mask']
-            
-        # Ensure mask has channel dimension (1, H, W) for loss calculation
-        if isinstance(mask, np.ndarray):
-            mask = np.expand_dims(mask, axis=0)
-            mask = torch.from_numpy(mask)
-        elif isinstance(mask, torch.Tensor) and mask.ndim == 2:
-            mask = mask.unsqueeze(0)
-            
-        return {'image': image, 'mask': mask}
